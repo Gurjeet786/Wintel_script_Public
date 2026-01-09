@@ -1,4 +1,5 @@
 
+
 $VCServers = @(
     'Cevc01.skanska.pl',
     'Sevc10.skanska.net',
@@ -13,9 +14,9 @@ $OutputCsv    = Join-Path $OutputFolder 'VMware_HBA_Multipath_All.csv'
 $LogFile      = Join-Path $OutputFolder 'VMware_HBA_Multipath.log'
 
 # Filters (leave empty/blank to disable)
-$ClusterFilterNames   = @()        # e.g., @('Prod-Cluster-A','Prod-Cluster-B')
-$DatacenterFilterNames= @()        # e.g., @('DC-East','DC-West')
-$HostNameRegex        = '.*'       # e.g., '^.*prod.*$' ; default matches all
+$ClusterFilterNames    = @()       # e.g., @('Prod-Cluster-A','Prod-Cluster-B')
+$DatacenterFilterNames = @()       # e.g., @('DC-East','DC-West')
+$HostNameRegex         = '.*'      # e.g., '^.*prod.*$' ; default matches all
 
 # ---------------------------
 # Prep
@@ -23,6 +24,7 @@ $HostNameRegex        = '.*'       # e.g., '^.*prod.*$' ; default matches all
 if (-not (Test-Path -LiteralPath $OutputFolder)) {
     New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
 }
+
 # Reset log
 "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Starting collection" | Out-File -FilePath $LogFile -Encoding UTF8
 
@@ -55,25 +57,18 @@ function Get-PropValue {
     return $null
 }
 
-function Safe-InvokeEsxcli {
-    param(
-        [Parameter(Mandatory=$true)]$Method
-    )
-    try {
-        return $Method.Invoke()
-    } catch {
-        Write-Log "ESXCLI invoke failed: $($_.Exception.Message)"
-        return @()
-    }
+function Try-Esxcli {
+    param([scriptblock]$Block)
+    try { & $Block } catch { Write-Log "ESXCLI call failed: $($_.Exception.Message)"; @() }
 }
 
 # ---------------------------
-# Data collection structures
+# Data structures
 # ---------------------------
 $rows = New-Object System.Collections.Generic.List[object]
 
-# Summary per-vCenter
-$summaryByVC = @{} # vc -> @{HostsProcessed=0; HostsWithDeadPaths=0; TotalPaths=0; DeadPaths=0; PSPCounts=@{}; SATPCounts=@{} }
+# Summary per vCenter
+$summaryByVC = @{} # vc -> @{HostsProcessed=0; HostsWithDeadPaths=0; TotalPaths=0; DeadPaths=0; PSPCounts=@{}; SATPCounts=@{}; HostsDeadPathsList=@() }
 
 # ---------------------------
 # Main loop per vCenter
@@ -89,48 +84,92 @@ foreach ($vc in $VCServers) {
     } catch {
         Write-Warning "Failed to connect to $vc: $($_.Exception.Message)"
         Write-Log     "Failed to connect to $vc: $($_.Exception.Message)"
-        # Record summary stub and continue
+        # Initialize summary and emit info row
         $summaryByVC[$vc] = @{
-            HostsProcessed    = 0
-            HostsWithDeadPaths= 0
-            TotalPaths        = 0
-            DeadPaths         = 0
-            PSPCounts         = @{}
-            SATPCounts        = @{}
+            HostsProcessed     = 0
+            HostsWithDeadPaths = 0
+            TotalPaths         = 0
+            DeadPaths          = 0
+            PSPCounts          = @{}
+            SATPCounts         = @{}
+            HostsDeadPathsList = @()
         }
+        $rows.Add([pscustomobject]@{
+            Section               = 'Info'
+            vCenter               = $vc
+            Datacenter            = ''
+            Cluster               = ''
+            HostName              = ''
+            HostOS                = ''
+            HBA_Adapter           = ''
+            HBA_MakeModel         = ''
+            HBA_FirmwareVersion   = ''
+            HBA_Driver            = ''
+            HBA_QueueDepth        = ''
+            HBA_LinkSpeed         = ''
+            WWPN                  = ''
+            IQN                   = ''
+            Device_Canonical      = ''
+            Device_DisplayName    = ''
+            SATP                  = ''
+            PSP                   = ''
+            PSP_Options           = ''
+            Device_PathCount      = ''
+            Device_ActivePaths    = ''
+            Device_Operational    = ''
+            Path_RuntimeName      = ''
+            Path_Target           = ''
+            Path_LUN              = ''
+            Path_State            = ''
+            Path_Preferred        = ''
+            Path_Working          = ''
+            Path_Transport        = ''
+            Summary_Metric        = 'Info'
+            Summary_Value         = "Connection failed for $vc"
+            Summary_Notes         = ''
+        })
         continue
     }
 
     try {
-        # Build location filter (clusters/datacenters)
+        # Build filter locations (clusters/datacenters)
         $locations = @()
-        if ($ClusterFilterNames -and $ClusterFilterNames.Count -gt 0) {
-            foreach ($c in $ClusterFilterNames) {
-                $clusterObj = Get-Cluster -Name $c -ErrorAction SilentlyContinue
-                if ($clusterObj) { $locations += $clusterObj } else { Write-Log "Cluster not found: $c" }
+        if ($ClusterFilterNames.Count -gt 0) {
+            foreach ($cName in $ClusterFilterNames) {
+                $clusterObj = Get-Cluster -Name $cName -ErrorAction SilentlyContinue
+                if ($clusterObj) { $locations += $clusterObj } else { Write-Log "Cluster not found: $cName" }
             }
         }
-        if ($DatacenterFilterNames -and $DatacenterFilterNames.Count -gt 0) {
-            foreach ($d in $DatacenterFilterNames) {
-                $dcObj = Get-Datacenter -Name $d -ErrorAction SilentlyContinue
-                if ($dcObj) { $locations += $dcObj } else { Write-Log "Datacenter not found: $d" }
+        if ($DatacenterFilterNames.Count -gt 0) {
+            foreach ($dName in $DatacenterFilterNames) {
+                $dcObj = Get-Datacenter -Name $dName -ErrorAction SilentlyContinue
+                if ($dcObj) { $locations += $dcObj } else { Write-Log "Datacenter not found: $dName" }
             }
         }
 
+        # Get hosts
         $esxiHosts = @()
-        if ($locations -and $locations.Count -gt 0) {
+        if ($locations.Count -gt 0) {
             $esxiHosts = Get-VMHost -Location $locations -ErrorAction SilentlyContinue
         } else {
             $esxiHosts = Get-VMHost -ErrorAction SilentlyContinue
         }
 
-        # Final regex filter on host names
+        # Regex filter
         $esxiHosts = $esxiHosts | Where-Object { $_.Name -match $HostNameRegex }
 
         if (-not $esxiHosts -or $esxiHosts.Count -eq 0) {
             Write-Warning "No hosts matched filters on $vc"
             Write-Log     "No hosts matched filters on $vc"
-            # Still append an informational row so the CSV is not empty
+            $summaryByVC[$vc] = @{
+                HostsProcessed     = 0
+                HostsWithDeadPaths = 0
+                TotalPaths         = 0
+                DeadPaths          = 0
+                PSPCounts          = @{}
+                SATPCounts         = @{}
+                HostsDeadPathsList = @()
+            }
             $rows.Add([pscustomobject]@{
                 Section               = 'Info'
                 vCenter               = $vc
@@ -165,28 +204,19 @@ foreach ($vc in $VCServers) {
                 Summary_Value         = "No hosts matched filters for $vc"
                 Summary_Notes         = ''
             })
-            # Initialize summary
-            $summaryByVC[$vc] = @{
-                HostsProcessed    = 0
-                HostsWithDeadPaths= 0
-                TotalPaths        = 0
-                DeadPaths         = 0
-                PSPCounts         = @{}
-                SATPCounts        = @{}
-            }
-            # Move to next vCenter
             Disconnect-VIServer -Server $vc -Confirm:$false | Out-Null
             continue
         }
 
-        # Initialize summary counters
+        # Init summary
         $summaryByVC[$vc] = @{
-            HostsProcessed    = 0
-            HostsWithDeadPaths= 0
-            TotalPaths        = 0
-            DeadPaths         = 0
-            PSPCounts         = @{}
-            SATPCounts        = @{}
+            HostsProcessed     = 0
+            HostsWithDeadPaths = 0
+            TotalPaths         = 0
+            DeadPaths          = 0
+            PSPCounts          = @{}
+            SATPCounts         = @{}
+            HostsDeadPathsList = @()
         }
 
         foreach ($esxiHost in $esxiHosts) {
@@ -196,57 +226,51 @@ foreach ($vc in $VCServers) {
 
             $hostOs = "ESXi $($esxiHost.Version) (Build $($esxiHost.Build))"
 
-            # Resolve cluster/datacenter names (safe approach)
-            $clusterName  = ($esxiHost | Get-Cluster -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
-            if (-not $clusterName) { $clusterName = '' }
+            # Resolve cluster/datacenter names
+            $clusterName = ''
+            try {
+                $clusterObj = Get-Cluster -VMHost $esxiHost -ErrorAction SilentlyContinue
+                if ($clusterObj) { $clusterName = $clusterObj.Name }
+            } catch { $clusterName = '' }
+
             $datacenterName = ''
             try {
-                $parentCluster = ($esxiHost | Get-Cluster -ErrorAction SilentlyContinue)
-                if ($parentCluster) {
-                    $dc = ($parentCluster | Get-View).Parent
-                    if ($dc) {
-                        $dcView = Get-View -Id $dc -ErrorAction SilentlyContinue
-                        if ($dcView.Name) { $datacenterName = $dcView.Name }
-                    }
+                if ($clusterObj) {
+                    $clusterView  = Get-View -Id $clusterObj.Id -ErrorAction SilentlyContinue
+                    $dcRef        = $clusterView.Parent
+                    $dcView       = Get-View -Id $dcRef -ErrorAction SilentlyContinue
+                    if ($dcView -and $dcView.Name) { $datacenterName = $dcView.Name }
                 }
             } catch { $datacenterName = '' }
 
+            # ESXCLI v2
             $esxcli = Get-EsxCli -VMHost $esxiHost -V2
 
-            # ---------- HBA info & firmware/driver/queue/link ----------
-            # NOTE: FCoE type removed to avoid enum errors in some PowerCLI versions.
+            # ---------- HBA info ----------
+            # NOTE: Avoid FCoE in -Type to prevent enum errors; filter types afterward.
             $hbas = @()
             try {
-                $hbas = Get-VMHostHba -VMHost $esxiHost -Type FibreChannel,iSCSI -ErrorAction SilentlyContinue
+                $hbas = Get-VMHostHba -VMHost $esxiHost -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Type -match 'FibreChannel|iScsi|ParallelScsi' }
             } catch {
                 Write-Log "Get-VMHostHba failed on $($esxiHost.Name): $($_.Exception.Message)"
                 $hbas = @()
             }
 
-            $adapterList = Safe-InvokeEsxcli -Method $esxcli.storage.core.adapter.list
+            $adapterList = Try-Esxcli { $esxcli.storage.core.adapter.list.Invoke() }
             $hbaInfoByAdapter = @{} # adapter -> @{MakeModel; Firmware; Driver; QueueDepth; LinkSpeed}
 
             foreach ($adapter in $adapterList) {
                 $adapterName = Get-PropValue -Obj $adapter -Candidates @('Adapter','Name')
                 if (-not $adapterName) { continue }
 
-                # Pull "Description" from list; fallback later if HBA object exists
                 $listDesc = Get-PropValue -Obj $adapter -Candidates @('Description')
 
-                # Details via get
-                $getArgs = $esxcli.storage.core.adapter.get.CreateArgs()
-                $getArgs.Adapter = $adapterName
-                $adapterDetails  = Safe-InvokeEsxcli -Method ($esxcli.storage.core.adapter.get.CreateArgs().GetType() | Out-Null; $esxcli.storage.core.adapter.get.Invoke($getArgs))
-                # Above line ensures the CreateArgs exists; if Invoke fails, adapterDetails becomes @()
-
-                # Because Invoke in try/catch is tricky, retrieve via a safer pattern:
-                try {
+                # adapter.get details (safe)
+                $adapterDetails = Try-Esxcli {
                     $getArgs = $esxcli.storage.core.adapter.get.CreateArgs()
                     $getArgs.Adapter = $adapterName
-                    $adapterDetails = $esxcli.storage.core.adapter.get.Invoke($getArgs)
-                } catch {
-                    $adapterDetails = $null
-                    Write-Log "adapter.get failed for $adapterName: $($_.Exception.Message)"
+                    $esxcli.storage.core.adapter.get.Invoke($getArgs)
                 }
 
                 $fw        = if ($adapterDetails) { Get-PropValue -Obj $adapterDetails -Candidates @('Firmware Version','FirmwareVersion') } else { '' }
@@ -254,7 +278,7 @@ foreach ($vc in $VCServers) {
                 $qDepth    = if ($adapterDetails) { Get-PropValue -Obj $adapterDetails -Candidates @('Queue Depth','QueueDepth') } else { '' }
                 $linkSpeed = if ($adapterDetails) { Get-PropValue -Obj $adapterDetails -Candidates @('Link Speed','Speed') } else { '' }
 
-                # Attempt to derive Make/Model from PowerCLI HBA objects
+                # Derive Make/Model from HBA object
                 $makeModel = ''
                 $hbaMatch = $hbas | Where-Object { $_.Device -eq $adapterName }
                 if ($hbaMatch) {
@@ -276,10 +300,9 @@ foreach ($vc in $VCServers) {
             }
 
             # ---------- FC WWPNs & iSCSI sessions ----------
-            $fcList    = Safe-InvokeEsxcli -Method $esxcli.storage.san.fc.list
-            $iscsiList = Safe-InvokeEsxcli -Method $esxcli.iscsi.session.list
+            $fcList    = Try-Esxcli { $esxcli.storage.san.fc.list.Invoke() }
+            $iscsiList = Try-Esxcli { $esxcli.iscsi.session.list.Invoke() }
 
-            # Build maps for quick lookup
             $wwpnByAdapter = @{}
             foreach ($fc in $fcList) {
                 $fcAdapter = Get-PropValue -Obj $fc -Candidates @('Adapter')
@@ -298,11 +321,11 @@ foreach ($vc in $VCServers) {
             }
 
             # ---------- Multipath device + paths ----------
-            $nmpDevices = Safe-InvokeEsxcli -Method $esxcli.storage.nmp.device.list
-            $nmpPaths   = Safe-InvokeEsxcli -Method $esxcli.storage.nmp.path.list
-            $corePaths  = Safe-InvokeEsxcli -Method $esxcli.storage.core.path.list
+            $nmpDevices = Try-Esxcli { $esxcli.storage.nmp.device.list.Invoke() }
+            $nmpPaths   = Try-Esxcli { $esxcli.storage.nmp.path.list.Invoke() }
+            $corePaths  = Try-Esxcli { $esxcli.storage.core.path.list.Invoke() }
 
-            # Build device map for SATP/PSP/options/Display/Operational
+            # Device map for SATP/PSP/options/Display/Operational
             $nmpDeviceMap = @{}
             foreach ($dev in $nmpDevices) {
                 $canonical = Get-PropValue -Obj $dev -Candidates @('Device','Canonical Name')
@@ -337,7 +360,7 @@ foreach ($vc in $VCServers) {
             $activeCountByDevice = @{}
             $hostHasDeadPath     = $false
 
-            # Build NMP runtime meta
+            # NMP runtime meta
             $nmpPathMetaByRuntime = @{}
             foreach ($np in $nmpPaths) {
                 $rt   = Get-PropValue -Obj $np -Candidates @('Runtime Name','RuntimeName','Name','Path')
@@ -376,9 +399,12 @@ foreach ($vc in $VCServers) {
                 }
             }
 
-            if ($hostHasDeadPath) { $summaryByVC[$vc].HostsWithDeadPaths++ }
+            if ($hostHasDeadPath) {
+                $summaryByVC[$vc].HostsWithDeadPaths++
+                $summaryByVC[$vc].HostsDeadPathsList += $esxiHost.Name
+            }
 
-            # ---------- Emit detailed rows (one per path); if no paths, emit device-only rows ----------
+            # ---------- Emit detailed rows (one per path); else device-only rows ----------
             if ($corePaths -and $corePaths.Count -gt 0) {
                 foreach ($p in $corePaths) {
                     $canonical = Get-PropValue -Obj $p -Candidates @('Device')
@@ -458,7 +484,7 @@ foreach ($vc in $VCServers) {
                     })
                 }
             } else {
-                # No core paths; emit device-only lines
+                # No core paths; emit device-only rows
                 foreach ($dev in $nmpDevices) {
                     $canonical = Get-PropValue -Obj $dev -Candidates @('Device','Canonical Name')
                     if (-not $canonical) { continue }
@@ -543,10 +569,10 @@ foreach ($vc in $VCServers) {
             Path_Transport      = ''
             Summary_Metric      = 'vCenter Summary'
             Summary_Value       = "HostsProcessed=$($summaryByVC[$vc].HostsProcessed); HostsWithDeadPaths=$($summaryByVC[$vc].HostsWithDeadPaths); TotalPaths=$($summaryByVC[$vc].TotalPaths); DeadPaths=$($summaryByVC[$vc].DeadPaths)"
-            Summary_Notes       = ''
+            Summary_Notes       = "HostsWithDeadPathsList=$([string]::Join('; ', $summaryByVC[$vc].HostsDeadPathsList))"
         })
 
-        foreach ($k in $summaryByVC[$vc].PSPCounts.Keys) {
+        foreach ($pspKey in $summaryByVC[$vc].PSPCounts.Keys) {
             $rows.Add([pscustomobject]@{
                 Section             = 'Summary'
                 vCenter             = $vc
@@ -565,7 +591,7 @@ foreach ($vc in $VCServers) {
                 Device_Canonical    = ''
                 Device_DisplayName  = ''
                 SATP                = ''
-                PSP                 = $k
+                PSP                 = $pspKey
                 PSP_Options         = ''
                 Device_PathCount    = ''
                 Device_ActivePaths  = ''
@@ -578,12 +604,12 @@ foreach ($vc in $VCServers) {
                 Path_Working        = ''
                 Path_Transport      = ''
                 Summary_Metric      = 'PSP Count'
-                Summary_Value       = $summaryByVC[$vc].PSPCounts[$k]
+                Summary_Value       = $summaryByVC[$vc].PSPCounts[$pspKey]
                 Summary_Notes       = ''
             })
         }
 
-        foreach ($k in $summaryByVC[$vc].SATPCounts.Keys) {
+        foreach ($satpKey in $summaryByVC[$vc].SATPCounts.Keys) {
             $rows.Add([pscustomobject]@{
                 Section             = 'Summary'
                 vCenter             = $vc
@@ -601,7 +627,7 @@ foreach ($vc in $VCServers) {
                 IQN                 = ''
                 Device_Canonical    = ''
                 Device_DisplayName  = ''
-                SATP                = $k
+                SATP                = $satpKey
                 PSP                 = ''
                 PSP_Options         = ''
                 Device_PathCount    = ''
@@ -615,7 +641,7 @@ foreach ($vc in $VCServers) {
                 Path_Working        = ''
                 Path_Transport      = ''
                 Summary_Metric      = 'SATP Count'
-                Summary_Value       = $summaryByVC[$vc].SATPCounts[$k]
+                Summary_Value       = $summaryByVC[$vc].SATPCounts[$satpKey]
                 Summary_Notes       = ''
             })
         }
