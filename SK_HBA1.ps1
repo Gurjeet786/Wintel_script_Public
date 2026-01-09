@@ -1,6 +1,3 @@
-
-
-# --- List of vCenters ---
 $vCenters = @(
     "Cevc01.skanska.pl",
     "Sevc10.skanska.net",
@@ -10,16 +7,14 @@ $vCenters = @(
     "USvcsa01.skanska.com"
 )
 
-# Ask for a single credential used for all vCenters
-$creds = Get-Credential
-
-# Enable multiple VIServer connections if not already configured [web:26]
+# Allow multiple connections [web:38]
 Set-PowerCLIConfiguration -DefaultVIServerMode Multiple -Confirm:$false | Out-Null
 
-# Connect to all vCenters [web:17][web:23]
+# Connect to each vCenter, prompting for creds every time [web:36][web:44]
 foreach ($vc in $vCenters) {
     try {
         Write-Host "Connecting to $vc..." -ForegroundColor Cyan
+        $creds = Get-Credential -Message "Enter credentials for $vc"
         Connect-VIServer -Server $vc -Credential $creds -ErrorAction Stop | Out-Null
     }
     catch {
@@ -34,7 +29,8 @@ if (-not (Test-Path $outFolder)) {
 }
 $outFile = Join-Path $outFolder "ESXi_HBA_Multipath_Info.csv"
 
-$vmhosts = Get-VMHost   # This will span all connected vCenters [web:17][web:23]
+# All hosts from all connected vCenters [web:17][web:23]
+$vmhosts = Get-VMHost  
 
 $report = @()
 
@@ -44,9 +40,12 @@ foreach ($vmhost in $vmhosts) {
                                        $hostView.Config.Product.Version,
                                        $hostView.Config.Product.Build
 
+    # vCenter of this host – substring after '@' in Uid [web:24]
+    $vcName = ($vmhost.Uid -split '@')[-1]
+
     $esxcli = Get-EsxCli -VMHost $vmhost -V2
 
-    # HBA info from FC/SAS lists [web:7]
+    # FC & SAS HBA info [web:31][web:43]
     $fcList  = $esxcli.storage.san.fc.list.Invoke()
     $sasList = $esxcli.storage.san.sas.list.Invoke()
 
@@ -54,77 +53,91 @@ foreach ($vmhost in $vmhosts) {
     if ($fcList)  { $hbaList += $fcList }
     if ($sasList) { $hbaList += $sasList }
 
-    # Multipath info (SATP/PSP) [web:15]
+    # Multipath info (per device) [web:9][web:34][web:40]
     $nmpDevices = $esxcli.storage.nmp.device.list.Invoke()
 
     if (-not $hbaList) {
+        # Still output a line so host is visible even without HBA
         $report += [pscustomobject]@{
-            vCenter           = $vmhost.Uid.Split("@")[1]   # origin vCenter [web:23]
-            HostName          = $vmhost.Name
-            HostOS            = $hostOS
-            HbaDevice         = ""
-            HbaMake           = "No FC/SAS HBA found"
-            HbaFirmware       = ""
-            MultipathDevices  = ""
-            MultipathSATP_PSP = ""
+            vCenter         = $vcName
+            HostName        = $vmhost.Name
+            HostOS          = $hostOS
+            HbaName         = $null
+            HbaModel        = "No FC/SAS HBA found"
+            HbaVendor       = $null
+            HbaDriver       = $null
+            HbaFirmware     = $null
+            MultipathDevice = $null
+            MultipathSATP   = $null
+            MultipathPSP    = $null
         }
         continue
     }
 
     foreach ($hba in $hbaList) {
-        $hbaDevice   = $hba.Adapter | Out-String
+        # Normalise ESXCLI properties into discrete columns [web:31][web:43]
+        $hbaName     = $null
         $hbaModel    = $null
+        $hbaVendor   = $null
+        $hbaDriver   = $null
         $hbaFirmware = $null
 
+        if ($hba.PSObject.Properties.Name -contains 'Adapter') {
+            $hbaName = $hba.Adapter
+        }
         if ($hba.PSObject.Properties.Name -contains 'Model') {
             $hbaModel = $hba.Model
         } elseif ($hba.PSObject.Properties.Name -contains 'Description') {
             $hbaModel = $hba.Description
         }
-
+        if ($hba.PSObject.Properties.Name -contains 'Vendor') {
+            $hbaVendor = $hba.Vendor
+        }
+        if ($hba.PSObject.Properties.Name -contains 'DriverName') {
+            $hbaDriver = $hba.DriverName
+        } elseif ($hba.PSObject.Properties.Name -contains 'Driver') {
+            $hbaDriver = $hba.Driver
+        }
         if ($hba.PSObject.Properties.Name -contains 'FirmwareVersion') {
             $hbaFirmware = $hba.FirmwareVersion
         } elseif ($hba.PSObject.Properties.Name -contains 'Firmware') {
             $hbaFirmware = $hba.Firmware
         }
 
-        $mpEntries = @()
+        # For each HBA, create one row per attached device + SATP/PSP [web:34][web:40]
         foreach ($dev in $nmpDevices) {
-            $satp = $null
-            $psp  = $null
+            $deviceId = $null
+            $satp     = $null
+            $psp      = $null
 
+            if ($dev.PSObject.Properties.Name -contains 'Device') {
+                $deviceId = $dev.Device
+            }
             if ($dev.PSObject.Properties.Name -contains 'StorageArrayType') {
                 $satp = $dev.StorageArrayType
             } elseif ($dev.PSObject.Properties.Name -contains 'StorageArrayTypePlugin') {
                 $satp = $dev.StorageArrayTypePlugin
             }
-
             if ($dev.PSObject.Properties.Name -contains 'PathSelectionPolicy') {
                 $psp = $dev.PathSelectionPolicy
             }
 
-            $deviceId = $null
-            if ($dev.PSObject.Properties.Name -contains 'Device') {
-                $deviceId = $dev.Device
-            }
-
+            # Only output rows that have a device and multipath policy
             if ($deviceId -and $satp -and $psp) {
-                $mpEntries += "{0}: {1}/{2}" -f $deviceId, $satp, $psp
+                $report += [pscustomobject]@{
+                    vCenter         = $vcName
+                    HostName        = $vmhost.Name
+                    HostOS          = $hostOS
+                    HbaName         = $hbaName
+                    HbaModel        = $hbaModel
+                    HbaVendor       = $hbaVendor
+                    HbaDriver       = $hbaDriver
+                    HbaFirmware     = $hbaFirmware
+                    MultipathDevice = $deviceId
+                    MultipathSATP   = $satp
+                    MultipathPSP    = $psp
+                }
             }
-        }
-
-        $mpDevices  = ($mpEntries | ForEach-Object { ($_ -split ':')[0] } | Select-Object -Unique) -join '; '
-        $mpSatpPsp  = ($mpEntries | Select-Object -Unique) -join '; '
-
-        $report += [pscustomobject]@{
-            vCenter           = $vmhost.Uid.Split("@")[1]
-            HostName          = $vmhost.Name
-            HostOS            = $hostOS
-            HbaDevice         = $hbaDevice.Trim()
-            HbaMake           = $hbaModel
-            HbaFirmware       = $hbaFirmware
-            MultipathDevices  = $mpDevices
-            MultipathSATP_PSP = $mpSatpPsp
         }
     }
 }
