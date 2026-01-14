@@ -1,11 +1,4 @@
-$vCenters = @(
-    "Cevc01.skanska.pl",
-    "Sevc10.skanska.net",
-    "Sevc20.skanska.net",
-    "Sevc50.skanska.net",
-    "Sevc70.skanska.net",
-    "USvcsa01.skanska.com"
-)
+$vCenters = @(List of vcenter)
 
 # Allow multiple connections [web:38]
 Set-PowerCLIConfiguration -DefaultVIServerMode Multiple -Confirm:$false | Out-Null
