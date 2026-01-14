@@ -1,13 +1,7 @@
 
 
-$VCServers = @(
-    'Cevc01.skanska.pl',
-    'Sevc10.skanska.net',
-    'Sevc20.skanska.net',
-    'Sevc50.skanska.net',
-    'Sevc70.skanska.net',
-    'USvcsa01.skanska.com'
-)
+$VCServers = @(List of vcenter)
+
 
 $OutputFolder = 'C:\temp'
 $OutputCsv    = Join-Path $OutputFolder 'VMware_HBA_Multipath_All.csv'
